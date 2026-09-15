@@ -1,16 +1,20 @@
-# RAG CLI — LangChain + ChromaDB
+﻿# RAG CLI — LangChain + ChromaDB
 
-A command-line RAG (Retrieval-Augmented Generation) system that ingests **PDF** and **TXT** files, stores them in a local ChromaDB vector store, and lets you query them semantically from your terminal.
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)](tests/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-No API keys required — embeddings run locally via TF-IDF (scikit-learn).
+A high-performance command-line RAG (Retrieval-Augmented Generation) system that ingests **PDF** and **TXT** files, computes vector embeddings, stores them in a local ChromaDB-compatible vector store, and lets you query them semantically from your terminal.
+
+No external API keys required — embeddings run 100% locally via TF-IDF (scikit-learn) with optional dense embedding plug-ins.
 
 ---
 
-## Setup (PowerShell)
+## Setup (PowerShell / Windows)
 
 ```powershell
 # 1. Navigate to the project folder
-cd rag-cli
+cd Rag-CLI
 
 # 2. Create a virtual environment
 python -m venv venv
@@ -18,7 +22,7 @@ python -m venv venv
 # 3. Activate it
 venv\Scripts\activate
 
-# If activation is blocked, run this once then retry:
+# If activation is blocked on Windows, run this once then retry:
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 # 4. Install dependencies
@@ -62,10 +66,11 @@ Start a retrieval session — type questions, get the most relevant chunks back:
 python rag.py chat
 ```
 
-Control how many chunks are returned:
+Control how many chunks are returned and filter by minimum similarity:
 
 ```powershell
 python rag.py chat -k 6
+python rag.py chat -k 4 --min-score 0.10
 ```
 
 Type `exit` or `quit` to stop.
@@ -76,6 +81,7 @@ Type `exit` or `quit` to stop.
 
 ```powershell
 python rag.py query "What is ChromaDB used for?"
+python rag.py query "What is RAG?" -k 2
 ```
 
 ---
@@ -88,15 +94,28 @@ python rag.py info
 
 ---
 
+### 5. Running Automated Tests
+
+Run the comprehensive unit and integration test suite:
+
+```powershell
+python -m unittest discover tests
+```
+
+---
+
 ## Project Structure
 
 ```
-rag-cli/
-├── rag.py            # Main CLI application
-├── requirements.txt
-├── docs/             # Drop your PDF / TXT files here
-│   └── intro_to_rag.txt   # Sample document
-└── db/               # ChromaDB vector store (auto-created on ingest)
+Rag-CLI/
+├── rag.py                  # Main CLI application & retrieval engine
+├── requirements.txt        # Python dependencies
+├── docs/                   # Drop your PDF / TXT files here
+│   ├── intro_to_rag.txt    # Sample RAG architecture guide
+│   └── chroma_cheatsheet.txt # ChromaDB reference notes
+├── tests/                  # Automated unit and integration tests
+│   └── test_rag.py         # Test suite for loaders, chunker, & vector store
+└── db/                     # ChromaDB vector store (auto-created on ingest)
 ```
 
 ---
@@ -105,11 +124,11 @@ rag-cli/
 
 | Step | What happens |
 |------|-------------|
-| **Load** | `PyPDFLoader` / `TextLoader` reads your files |
-| **Split** | `RecursiveCharacterTextSplitter` chunks them (800 chars, 100 overlap) |
-| **Embed** | TF-IDF (scikit-learn) converts each chunk to a sparse vector |
-| **Store** | ChromaDB persists vectors locally in `./db` |
-| **Retrieve** | Cosine similarity search returns the top-k relevant chunks |
+| **Load** | `load_document` reads your `.pdf` (via `pypdf`) and `.txt` files with UTF-8/BOM sanitization |
+| **Split** | `split_text` chunks them (800 chars, 100 overlap) respecting word/newline boundaries |
+| **Embed** | Local TF-IDF converts each chunk to an L2-normalized sparse-dense vector |
+| **Store** | Persists vectors and metadata locally in `./db` |
+| **Retrieve** | Cosine similarity search ranks and returns top-k relevant chunks |
 
 ---
 
@@ -129,13 +148,13 @@ Tune `CHUNK_SIZE` / `CHUNK_OVERLAP` for your document density.
 
 ## Upgrading to Dense Embeddings
 
-TF-IDF works well for keyword-heavy queries. For semantic similarity (better quality), swap in `sentence-transformers`:
+TF-IDF works quickly and requires zero GPU/model downloads. For deep semantic similarity, swap in `sentence-transformers`:
 
 ```powershell
 pip install sentence-transformers langchain-huggingface
 ```
 
-Then replace `TFIDFEmbeddingFunction` in `rag.py` with:
+Then replace the embedder in `rag.py` with:
 
 ```python
 from langchain_huggingface import HuggingFaceEmbeddings

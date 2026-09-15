@@ -5,6 +5,7 @@ Supports PDF and TXT document ingestion, chunking, and local vector retrieval.
 
 import os
 import sys
+import time
 import json
 import math
 import shutil
@@ -24,6 +25,16 @@ DOCS_DIR = os.environ.get("DOCS_DIR", "./docs")
 EMBED_DIM = 1024
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
+
+BANNER = r"""
+=============================================================
+   ___            ___      ____ _     ___ 
+  | _ \  __ _  __/ __|    / ___| |   |_ _|
+  |   / / _` || (_ | --- | |   | |    | | 
+  |_|_\ \__,_| \___|      \____|___| |___|
+  Local Semantic Retrieval-Augmented Generation Engine
+=============================================================
+"""
 
 
 class LocalTFIDFEmbedder:
@@ -178,8 +189,8 @@ class LocalVectorStore:
 
         self.save()
 
-    def similarity_search(self, query: str, k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
-        """Computes cosine similarity against all chunks and returns top-k matches."""
+    def similarity_search(self, query: str, k: int = 4, min_score: float = 0.0) -> List[Tuple[Dict[str, Any], float]]:
+        """Computes cosine similarity against all chunks and returns top-k matches filtered by min_score."""
         if not self.chunks:
             return []
 
@@ -195,7 +206,8 @@ class LocalVectorStore:
                 dot = 0.0
             else:
                 dot = sum(a * b for a, b in zip(q_vec, c_vec))
-            scores.append((chunk, dot))
+            if dot >= min_score:
+                scores.append((chunk, dot))
 
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:k]
@@ -226,6 +238,9 @@ def load_pdf(file_path: str) -> str:
 
 def load_document(file_path: str) -> str:
     """Dispatches to appropriate loader based on file extension."""
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Target document '{file_path}' does not exist.")
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".txt":
         return load_txt(file_path)
@@ -292,6 +307,8 @@ def discover_documents(target_path: str) -> List[str]:
 
 def ingest(target_path: str = DOCS_DIR, reset: bool = False):
     """Loads documents, splits into chunks, and stores into the vector database."""
+    start_time = time.time()
+    print(BANNER)
     print(f"[*] Initializing ingestion pipeline (Target: {target_path})")
     store = LocalVectorStore()
 
@@ -332,13 +349,18 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
     if all_chunks:
         print(f"[*] Generating TF-IDF vector embeddings for {len(all_chunks)} chunks...")
         store.add_documents(all_chunks)
-        print(f"[SUCCESS] Ingestion completed! Stored {len(store.chunks)} total chunks in '{CHROMA_DIR}'.")
+        elapsed = time.time() - start_time
+        print(f"[SUCCESS] Ingestion completed in {elapsed:.2f}s! Stored {len(store.chunks)} total chunks in '{CHROMA_DIR}'.")
     else:
         print("[!] No chunks were produced.")
 
 
 def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
     """Utility to print search results in a clean, readable format."""
+    if not results:
+        print("\n[!] No matching document chunks exceeded the relevance threshold.")
+        return
+
     for rank, (chunk, score) in enumerate(results, start=1):
         meta = chunk.get("metadata", {})
         fname = meta.get("filename", "unknown")
@@ -353,7 +375,7 @@ def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
             print(f"  {line}")
 
 
-def query_store(query_text: str, k: int = 4):
+def query_store(query_text: str, k: int = 4, min_score: float = 0.0):
     """Performs one-shot semantic search and prints formatted results."""
     store = LocalVectorStore()
     if not store.chunks:
@@ -361,19 +383,22 @@ def query_store(query_text: str, k: int = 4):
         return
 
     print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks)\n" + "-" * 60)
-    results = store.similarity_search(query_text, k=k)
+    start_time = time.time()
+    results = store.similarity_search(query_text, k=k, min_score=min_score)
     format_search_results(results)
+    elapsed = (time.time() - start_time) * 1000
+    print(f"\n[Search completed in {elapsed:.1f} ms]")
 
 
-def chat_session(k: int = 4):
+def chat_session(k: int = 4, min_score: float = 0.0):
     """Starts an interactive command-line session for continuous retrieval."""
     store = LocalVectorStore()
     if not store.chunks:
         print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
         return
 
-    print("=" * 60)
-    print("       RAG CLI — Interactive Retrieval Session")
+    print(BANNER)
+    print("       Interactive Retrieval Session")
     print(f"       Chunks per query: {k} | Type 'exit' or 'quit' to end")
     print("=" * 60)
 
@@ -386,7 +411,7 @@ def chat_session(k: int = 4):
                 print("Exiting RAG session. Goodbye!")
                 break
 
-            results = store.similarity_search(prompt, k=k)
+            results = store.similarity_search(prompt, k=k, min_score=min_score)
             format_search_results(results)
         except (KeyboardInterrupt, EOFError):
             print("\nSession terminated by user. Goodbye!")
@@ -417,7 +442,11 @@ def show_info():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RAG CLI — Retrieval-Augmented Generation")
+    parser = argparse.ArgumentParser(
+        description="RAG CLI — Command-line Retrieval-Augmented Generation system",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py chat -k 3\n  python rag.py info",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Ingest command
@@ -429,10 +458,12 @@ if __name__ == "__main__":
     query_parser = subparsers.add_parser("query", help="One-shot semantic query")
     query_parser.add_argument("query_text", type=str, help="Search query string")
     query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
+    query_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
+    chat_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
 
     # Info command
     info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
@@ -441,10 +472,11 @@ if __name__ == "__main__":
     if args.command == "ingest":
         ingest(args.path, args.reset)
     elif args.command == "query":
-        query_store(args.query_text, args.top_k)
+        query_store(args.query_text, args.top_k, args.min_score)
     elif args.command == "chat":
-        chat_session(args.top_k)
+        chat_session(args.top_k, args.min_score)
     elif args.command == "info":
         show_info()
     else:
         parser.print_help()
+
