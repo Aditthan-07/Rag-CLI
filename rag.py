@@ -12,6 +12,12 @@ import argparse
 from collections import Counter
 from typing import List, Dict, Any, Tuple, Optional
 
+# Ensure standard streams handle UTF-8 properly on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Configuration
 CHROMA_DIR = os.environ.get("CHROMA_DIR", "./db")
 DOCS_DIR = os.environ.get("DOCS_DIR", "./docs")
@@ -50,17 +56,14 @@ class LocalTFIDFEmbedder:
         self.num_docs = len(documents)
         doc_freq = Counter()
 
-        # Count document occurrences for each term
         for doc in documents:
             tokens = set(self._tokenize(doc))
             for t in tokens:
                 doc_freq[t] += 1
 
-        # Select most common features up to max_features
         most_common = doc_freq.most_common(self.max_features)
         self.vocabulary = {word: idx for idx, (word, _) in enumerate(most_common)}
 
-        # Compute smoothed IDF
         self.idf = {}
         for word, count in most_common:
             self.idf[word] = math.log((1 + self.num_docs) / (1 + count)) + 1.0
@@ -122,7 +125,7 @@ class LocalTFIDFEmbedder:
 
 class LocalVectorStore:
     """
-    ChromaDB-compatible vector database interface.
+    Vector database interface.
     Persists document chunks, metadata, and embeddings locally in the DB directory.
     """
     def __init__(self, db_dir: str = CHROMA_DIR):
@@ -159,10 +162,8 @@ class LocalVectorStore:
         existing_docs = [c["text"] for c in self.chunks]
         all_docs = existing_docs + [d["text"] for d in documents]
 
-        # Fit TF-IDF on complete corpus
         self.embedder.fit(all_docs)
 
-        # Generate vectors for new documents
         new_texts = [d["text"] for d in documents]
         new_embeddings = self.embedder.embed_documents(new_texts)
 
@@ -170,7 +171,6 @@ class LocalVectorStore:
             d["embedding"] = emb
             self.chunks.append(d)
 
-        # Update existing embeddings with new vocabulary
         if existing_docs:
             updated_existing = self.embedder.embed_documents(existing_docs)
             for chunk, emb in zip(self.chunks[:len(existing_docs)], updated_existing):
@@ -178,10 +178,32 @@ class LocalVectorStore:
 
         self.save()
 
+    def similarity_search(self, query: str, k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
+        """Computes cosine similarity against all chunks and returns top-k matches."""
+        if not self.chunks:
+            return []
+
+        q_vec = self.embedder.embed_query(query)
+        q_norm = math.sqrt(sum(x * x for x in q_vec))
+        if q_norm == 0:
+            return [(self.chunks[i], 0.0) for i in range(min(k, len(self.chunks)))]
+
+        scores = []
+        for chunk in self.chunks:
+            c_vec = chunk.get("embedding", [])
+            if not c_vec or len(c_vec) != len(q_vec):
+                dot = 0.0
+            else:
+                dot = sum(a * b for a, b in zip(q_vec, c_vec))
+            scores.append((chunk, dot))
+
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores[:k]
+
 
 def load_txt(file_path: str) -> str:
-    """Reads text from a plain text file."""
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+    """Reads text from a plain text file, stripping BOM if present."""
+    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
         return f.read()
 
 
@@ -284,13 +306,11 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
 
     print(f"[+] Found {len(doc_files)} document(s) to process.")
     all_chunks = []
-    total_chars = 0
 
     for file_path in doc_files:
         try:
             content = load_document(file_path)
             chunks = split_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
-            total_chars += len(content)
             base_name = os.path.basename(file_path)
 
             for i, chunk_text in enumerate(chunks):
@@ -317,6 +337,53 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
         print("[!] No chunks were produced.")
 
 
+def query_store(query_text: str, k: int = 4):
+    """Performs one-shot semantic search and prints formatted results."""
+    store = LocalVectorStore()
+    if not store.chunks:
+        print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
+        return
+
+    print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks)\n" + "-" * 60)
+    results = store.similarity_search(query_text, k=k)
+
+    for rank, (chunk, score) in enumerate(results, start=1):
+        meta = chunk.get("metadata", {})
+        fname = meta.get("filename", "unknown")
+        idx = meta.get("chunk_index", 0)
+        tot = meta.get("total_chunks", 1)
+        sim_pct = max(0.0, score * 100)
+
+        print(f"\n[Result #{rank}] Score: {sim_pct:.1f}% | Source: {fname} (chunk {idx + 1}/{tot})")
+        print("~" * 60)
+        lines = chunk["text"].splitlines()
+        for line in lines:
+            print(f"  {line}")
+
+
+def show_info():
+    """Prints status and statistics about the vector store."""
+    store = LocalVectorStore()
+    print("\n" + "=" * 50)
+    print("           RAG CLI - VECTOR STORE INFO")
+    print("=" * 50)
+    print(f"Storage Directory  : {os.path.abspath(store.db_dir)}")
+    print(f"Total Chunks       : {len(store.chunks)}")
+
+    sources = set(c.get("metadata", {}).get("filename", "") for c in store.chunks)
+    sources.discard("")
+    print(f"Unique Documents   : {len(sources)}")
+    for s in sorted(sources):
+        chunk_count = sum(1 for c in store.chunks if c.get("metadata", {}).get("filename") == s)
+        print(f"  * {s} ({chunk_count} chunks)")
+
+    print(f"Vocabulary Size    : {len(store.embedder.vocabulary)} tokens")
+    if store.chunks:
+        avg_chars = sum(len(c["text"]) for c in store.chunks) / len(store.chunks)
+        print(f"Avg Chunk Length   : {avg_chars:.1f} characters")
+    print("=" * 50 + "\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RAG CLI — Retrieval-Augmented Generation")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -326,8 +393,20 @@ if __name__ == "__main__":
     ingest_parser.add_argument("path", nargs="?", default=DOCS_DIR, help="Path to file or folder")
     ingest_parser.add_argument("--reset", action="store_true", help="Clear existing database before ingest")
 
+    # Query command
+    query_parser = subparsers.add_parser("query", help="One-shot semantic query")
+    query_parser.add_argument("query_text", type=str, help="Search query string")
+    query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
+
+    # Info command
+    info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
+
     args = parser.parse_args()
     if args.command == "ingest":
         ingest(args.path, args.reset)
+    elif args.command == "query":
+        query_store(args.query_text, args.top_k)
+    elif args.command == "info":
+        show_info()
     else:
         parser.print_help()
