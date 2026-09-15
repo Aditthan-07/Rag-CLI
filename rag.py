@@ -337,6 +337,22 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
         print("[!] No chunks were produced.")
 
 
+def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
+    """Utility to print search results in a clean, readable format."""
+    for rank, (chunk, score) in enumerate(results, start=1):
+        meta = chunk.get("metadata", {})
+        fname = meta.get("filename", "unknown")
+        idx = meta.get("chunk_index", 0)
+        tot = meta.get("total_chunks", 1)
+        sim_pct = max(0.0, score * 100)
+
+        print(f"\n[Result #{rank}] Relevance: {sim_pct:.1f}% | Source: {fname} (chunk {idx + 1}/{tot})")
+        print("~" * 60)
+        lines = chunk["text"].splitlines()
+        for line in lines:
+            print(f"  {line}")
+
+
 def query_store(query_text: str, k: int = 4):
     """Performs one-shot semantic search and prints formatted results."""
     store = LocalVectorStore()
@@ -346,19 +362,35 @@ def query_store(query_text: str, k: int = 4):
 
     print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks)\n" + "-" * 60)
     results = store.similarity_search(query_text, k=k)
+    format_search_results(results)
 
-    for rank, (chunk, score) in enumerate(results, start=1):
-        meta = chunk.get("metadata", {})
-        fname = meta.get("filename", "unknown")
-        idx = meta.get("chunk_index", 0)
-        tot = meta.get("total_chunks", 1)
-        sim_pct = max(0.0, score * 100)
 
-        print(f"\n[Result #{rank}] Score: {sim_pct:.1f}% | Source: {fname} (chunk {idx + 1}/{tot})")
-        print("~" * 60)
-        lines = chunk["text"].splitlines()
-        for line in lines:
-            print(f"  {line}")
+def chat_session(k: int = 4):
+    """Starts an interactive command-line session for continuous retrieval."""
+    store = LocalVectorStore()
+    if not store.chunks:
+        print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
+        return
+
+    print("=" * 60)
+    print("       RAG CLI — Interactive Retrieval Session")
+    print(f"       Chunks per query: {k} | Type 'exit' or 'quit' to end")
+    print("=" * 60)
+
+    while True:
+        try:
+            prompt = input("\nrag> ").strip()
+            if not prompt:
+                continue
+            if prompt.lower() in ["exit", "quit", ":q"]:
+                print("Exiting RAG session. Goodbye!")
+                break
+
+            results = store.similarity_search(prompt, k=k)
+            format_search_results(results)
+        except (KeyboardInterrupt, EOFError):
+            print("\nSession terminated by user. Goodbye!")
+            break
 
 
 def show_info():
@@ -398,6 +430,10 @@ if __name__ == "__main__":
     query_parser.add_argument("query_text", type=str, help="Search query string")
     query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
 
+    # Chat command
+    chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
+    chat_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
+
     # Info command
     info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
 
@@ -406,6 +442,8 @@ if __name__ == "__main__":
         ingest(args.path, args.reset)
     elif args.command == "query":
         query_store(args.query_text, args.top_k)
+    elif args.command == "chat":
+        chat_session(args.top_k)
     elif args.command == "info":
         show_info()
     else:
