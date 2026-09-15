@@ -1,0 +1,8 @@
+﻿chromadb>=0.4.22
+langchain>=0.1.0
+langchain-community>=0.0.20
+pypdf>=4.0.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+rich>=13.7.0
+pytest>=8.0.0
