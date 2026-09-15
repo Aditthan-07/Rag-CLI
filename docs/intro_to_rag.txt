@@ -1,0 +1,53 @@
+﻿============================================================
+INTRODUCTION TO RETRIEVAL-AUGMENTED GENERATION (RAG)
+============================================================
+
+1. Overview
+Retrieval-Augmented Generation (RAG) is an architectural pattern in AI and NLP
+that enhances Large Language Models (LLMs) by grounding them with external,
+authoritative knowledge. Instead of relying solely on the static weights
+learned during training, a RAG system fetches relevant excerpts from an external
+knowledge base and supplies them as context to the generation model.
+
+2. Core Components
+A standard RAG pipeline consists of the following phases:
+
+a. Document Ingestion:
+   Source files (e.g., PDF, TXT, Markdown, HTML) are collected from local
+   folders, cloud storage, or databases.
+
+b. Text Splitting and Chunking:
+   Large documents are broken down into manageable pieces called "chunks".
+   Effective chunking typically maintains a fixed character or token size
+   (e.g., 500-1000 characters) with a small overlap (e.g., 100-200 characters)
+   to ensure that semantic meaning across boundaries is not lost.
+
+c. Vector Embeddings:
+   Each text chunk is converted into a numerical vector representation in a
+   high-dimensional space. Semantic similarity between chunks corresponds to
+   geometric proximity (e.g., high cosine similarity).
+   Algorithms range from frequency-based sparse representations (TF-IDF, BM25)
+   to dense neural embeddings (MiniLM, OpenAI text-embedding-3, BGE).
+
+d. Vector Database Indexing:
+   Vector databases (such as ChromaDB, Pinecone, FAISS, Weaviate, and Milvus)
+   store the embeddings alongside metadata (such as source filename, page number,
+   chunk index). They build indexing structures like HNSW (Hierarchical
+   Navigable Small World) for sub-millisecond approximate nearest neighbor (ANN)
+   searches.
+
+e. Semantic Retrieval:
+   When a user submits a query, the query string is transformed into the same
+   vector space. The system calculates distance metrics (Cosine similarity,
+   Euclidean distance, or Dot Product) to retrieve the top-k most relevant
+   chunks.
+
+f. Generation / Context Synthesis:
+   The retrieved chunks are formatted into a prompt template and passed to an LLM
+   to synthesize a factual, well-attributed response.
+
+3. Advantages of RAG
+- Halts Hallucinations: Grounds responses in verified reference data.
+- Up-to-date Knowledge: Eliminates the need for expensive model fine-tuning or retraining.
+- Source Attribution: Users can trace every fact back to the exact source document.
+- Enterprise Privacy: Proprietary or sensitive data remains secure on local infrastructure.

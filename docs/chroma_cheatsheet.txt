@@ -1,0 +1,38 @@
+﻿============================================================
+CHROMADB CHEATSHEET AND ARCHITECTURE NOTES
+============================================================
+
+ChromaDB is an open-source, AI-native vector database designed for developer
+productivity and simplicity.
+
+Key Concepts:
+- Client: The entry point to interact with ChromaDB. Can be ephemeral (InMemory)
+  or persistent (PersistentClient) writing to a local SQLite database and parquet files.
+- Collections: Namespaces where embeddings, documents, and metadata reside.
+  Similar to tables in traditional relational databases.
+- Distance Metrics: Supports 'cosine', 'l2' (squared Euclidean), and 'ip' (inner product).
+  Default distance in Chroma is typically L2 or Cosine depending on configuration.
+
+Common API Commands:
+1. Initialize Client:
+   import chromadb
+   client = chromadb.PersistentClient(path="./db")
+
+2. Get or Create Collection:
+   collection = client.get_or_create_collection(
+       name="rag_documents",
+       metadata={"hnsw:space": "cosine"}
+   )
+
+3. Add Documents:
+   collection.add(
+       documents=["Chunk 1 text", "Chunk 2 text"],
+       metadatas=[{"source": "doc1.txt"}, {"source": "doc2.txt"}],
+       ids=["id_0", "id_1"]
+   )
+
+4. Query:
+   results = collection.query(
+       query_texts=["What is RAG?"],
+       n_results=4
+   )
