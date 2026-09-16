@@ -1,10 +1,11 @@
 ﻿# RAG CLI — LangChain + ChromaDB
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)](tests/)
+[![CI](https://github.com/Aditthan-07/Rag-CLI/actions/workflows/ci.yml/badge.svg)](https://github.com/Aditthan-07/Rag-CLI/actions)
+[![Tests](https://img.shields.io/badge/Tests-7%20Passed-brightgreen.svg)](tests/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A high-performance command-line RAG (Retrieval-Augmented Generation) system that ingests **PDF** and **TXT** files, computes vector embeddings, stores them in a local ChromaDB-compatible vector store, and lets you query them semantically from your terminal.
+A high-performance command-line RAG (Retrieval-Augmented Generation) system that ingests **PDF**, **TXT**, and **MD** files, computes vector embeddings, stores them in a local ChromaDB-compatible vector store, and lets you query them semantically from your terminal.
 
 No external API keys required — embeddings run 100% locally via TF-IDF (scikit-learn) with optional dense embedding plug-ins.
 
@@ -37,7 +38,7 @@ pip install -r requirements.txt
 
 ### 1. Ingest documents
 
-Drop your `.pdf` or `.txt` files into the `docs/` folder, then run:
+Drop your `.pdf`, `.txt`, or `.md` files into the `docs/` folder, then run:
 
 ```powershell
 python rag.py ingest
@@ -77,11 +78,20 @@ Type `exit` or `quit` to stop.
 
 ---
 
-### 3. One-shot query
+### 3. One-shot query & Export
+
+Perform a semantic query directly from the terminal:
 
 ```powershell
 python rag.py query "What is ChromaDB used for?"
 python rag.py query "What is RAG?" -k 2
+```
+
+Export results with scores and citations directly to JSON or Markdown:
+
+```powershell
+python rag.py query "What are the chunking strategies?" --export results.json
+python rag.py query "What are the chunking strategies?" --export results.md
 ```
 
 ---
@@ -108,11 +118,15 @@ python -m unittest discover tests
 
 ```
 Rag-CLI/
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # GitHub Actions multi-OS / multi-Python CI
 ├── rag.py                  # Main CLI application & retrieval engine
 ├── requirements.txt        # Python dependencies
-├── docs/                   # Drop your PDF / TXT files here
+├── docs/                   # Drop your PDF / TXT / MD files here
 │   ├── intro_to_rag.txt    # Sample RAG architecture guide
-│   └── chroma_cheatsheet.txt # ChromaDB reference notes
+│   ├── chroma_cheatsheet.txt # ChromaDB reference notes
+│   └── rag_best_practices.md # Chunking & embedding selection guide
 ├── tests/                  # Automated unit and integration tests
 │   └── test_rag.py         # Test suite for loaders, chunker, & vector store
 └── db/                     # ChromaDB vector store (auto-created on ingest)
@@ -124,11 +138,12 @@ Rag-CLI/
 
 | Step | What happens |
 |------|-------------|
-| **Load** | `load_document` reads your `.pdf` (via `pypdf`) and `.txt` files with UTF-8/BOM sanitization |
+| **Load** | `load_document` reads your `.pdf` (via `pypdf`), `.txt`, and `.md` files with UTF-8/BOM sanitization |
 | **Split** | `split_text` chunks them (800 chars, 100 overlap) respecting word/newline boundaries |
 | **Embed** | Local TF-IDF converts each chunk to an L2-normalized sparse-dense vector |
 | **Store** | Persists vectors and metadata locally in `./db` |
 | **Retrieve** | Cosine similarity search ranks and returns top-k relevant chunks |
+| **Export** | Optionally outputs query results to structured JSON or Markdown reports |
 
 ---
 

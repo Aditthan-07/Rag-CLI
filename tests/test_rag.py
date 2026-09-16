@@ -4,6 +4,7 @@ Tests document loaders, chunking mechanics, TF-IDF embedder, and vector retrieva
 """
 
 import os
+import json
 import shutil
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from rag import (
     split_text,
     discover_documents,
     load_document,
+    export_results,
     LocalTFIDFEmbedder,
     LocalVectorStore,
 )
@@ -41,19 +43,32 @@ class TestRagPipeline(unittest.TestCase):
     def test_discover_documents(self):
         f1 = os.path.join(self.test_dir, "doc1.txt")
         f2 = os.path.join(self.test_dir, "doc2.pdf")
-        f3 = os.path.join(self.test_dir, "ignore.exe")
+        f3 = os.path.join(self.test_dir, "doc3.md")
+        f4 = os.path.join(self.test_dir, "ignore.exe")
 
         with open(f1, "w", encoding="utf-8") as f:
             f.write("Test doc 1")
         with open(f2, "w", encoding="utf-8") as f:
             f.write("Fake pdf header")
         with open(f3, "w", encoding="utf-8") as f:
+            f.write("# Markdown title\nContent")
+        with open(f4, "w", encoding="utf-8") as f:
             f.write("Binary content")
 
         found = discover_documents(self.test_dir)
         self.assertIn(f1, found)
         self.assertIn(f2, found)
-        self.assertNotIn(f3, found)
+        self.assertIn(f3, found)
+        self.assertNotIn(f4, found)
+
+    def test_load_markdown_document(self):
+        md_file = os.path.join(self.test_dir, "guide.md")
+        sample_md = "# Architecture\n\nVector databases empower RAG."
+        with open(md_file, "w", encoding="utf-8") as f:
+            f.write(sample_md)
+
+        content = load_document(md_file)
+        self.assertEqual(content, sample_md)
 
     def test_tfidf_embedder(self):
         docs = [
@@ -105,6 +120,36 @@ class TestRagPipeline(unittest.TestCase):
         # Test persistence
         reloaded_store = LocalVectorStore(db_dir=self.db_dir)
         self.assertEqual(len(reloaded_store.chunks), 2)
+
+    def test_export_results_json_and_md(self):
+        mock_results = [
+            (
+                {
+                    "id": "c1",
+                    "text": "Sample chunk for testing export.",
+                    "metadata": {"filename": "sample.md", "chunk_index": 0, "total_chunks": 1},
+                },
+                0.85,
+            )
+        ]
+
+        json_export = os.path.join(self.test_dir, "export.json")
+        export_results("Test query", mock_results, json_export)
+        self.assertTrue(os.path.isfile(json_export))
+
+        with open(json_export, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertEqual(data["query"], "Test query")
+            self.assertEqual(len(data["results"]), 1)
+            self.assertEqual(data["results"][0]["source"], "sample.md")
+
+        md_export = os.path.join(self.test_dir, "export.md")
+        export_results("Test query", mock_results, md_export)
+        self.assertTrue(os.path.isfile(md_export))
+        with open(md_export, "r", encoding="utf-8") as f:
+            md_content = f.read()
+            self.assertIn("# RAG Query Results", md_content)
+            self.assertIn("Sample chunk for testing export.", md_content)
 
 
 if __name__ == "__main__":
