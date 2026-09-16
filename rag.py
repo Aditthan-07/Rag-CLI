@@ -1,6 +1,6 @@
 ﻿"""
 RAG CLI — Command-line Retrieval-Augmented Generation system.
-Supports PDF and TXT document ingestion, chunking, and local vector retrieval.
+Supports PDF, TXT, and MD document ingestion, chunking, and local vector retrieval.
 """
 
 import os
@@ -214,7 +214,7 @@ class LocalVectorStore:
 
 
 def load_txt(file_path: str) -> str:
-    """Reads text from a plain text file, stripping BOM if present."""
+    """Reads text from a plain text or markdown file, stripping BOM if present."""
     with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
         return f.read()
 
@@ -242,12 +242,12 @@ def load_document(file_path: str) -> str:
         raise FileNotFoundError(f"Target document '{file_path}' does not exist.")
 
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".txt":
+    if ext in [".txt", ".md"]:
         return load_txt(file_path)
     elif ext == ".pdf":
         return load_pdf(file_path)
     else:
-        raise ValueError(f"Unsupported file format '{ext}'. Only .pdf and .txt are supported.")
+        raise ValueError(f"Unsupported file format '{ext}'. Only .pdf, .txt, and .md are supported.")
 
 
 def split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -288,10 +288,11 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHU
 
 
 def discover_documents(target_path: str) -> List[str]:
-    """Finds all supported documents (.pdf, .txt) in the specified file or directory path."""
+    """Finds all supported documents (.pdf, .txt, .md) in the specified file or directory path."""
+    supported = [".pdf", ".txt", ".md"]
     if os.path.isfile(target_path):
         ext = os.path.splitext(target_path)[1].lower()
-        if ext in [".pdf", ".txt"]:
+        if ext in supported:
             return [target_path]
         return []
 
@@ -300,7 +301,7 @@ def discover_documents(target_path: str) -> List[str]:
         for root, _, files in os.walk(target_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
-                if ext in [".pdf", ".txt"]:
+                if ext in supported:
                     found.append(os.path.join(root, file))
     return sorted(found)
 
@@ -318,7 +319,7 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
 
     doc_files = discover_documents(target_path)
     if not doc_files:
-        print(f"[!] No valid .pdf or .txt documents discovered in '{target_path}'.")
+        print(f"[!] No valid .pdf, .txt, or .md documents discovered in '{target_path}'.")
         return
 
     print(f"[+] Found {len(doc_files)} document(s) to process.")
@@ -375,8 +376,41 @@ def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
             print(f"  {line}")
 
 
-def query_store(query_text: str, k: int = 4, min_score: float = 0.0):
-    """Performs one-shot semantic search and prints formatted results."""
+def export_results(query_text: str, results: List[Tuple[Dict[str, Any], float]], export_path: str):
+    """Exports retrieved chunks to a JSON or Markdown file."""
+    ext = os.path.splitext(export_path)[1].lower()
+    data = {
+        "query": query_text,
+        "results_count": len(results),
+        "results": [
+            {
+                "rank": rank,
+                "score": float(f"{score:.4f}"),
+                "relevance_pct": float(f"{max(0.0, score * 100):.1f}"),
+                "source": chunk.get("metadata", {}).get("filename", "unknown"),
+                "chunk_index": chunk.get("metadata", {}).get("chunk_index", 0),
+                "total_chunks": chunk.get("metadata", {}).get("total_chunks", 1),
+                "text": chunk.get("text", ""),
+            }
+            for rank, (chunk, score) in enumerate(results, start=1)
+        ]
+    }
+    if ext == ".json":
+        with open(export_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"\n[+] Results exported to JSON: {export_path}")
+    else:
+        with open(export_path, "w", encoding="utf-8") as f:
+            f.write(f"# RAG Query Results: \"{query_text}\"\n\n")
+            f.write(f"**Total Matches**: {len(results)}\n\n---\n\n")
+            for item in data["results"]:
+                f.write(f"### Result #{item['rank']} (Relevance: {item['relevance_pct']}%) — `{item['source']}` (chunk {item['chunk_index'] + 1}/{item['total_chunks']})\n\n")
+                f.write(f"```text\n{item['text']}\n```\n\n")
+        print(f"\n[+] Results exported to Markdown: {export_path}")
+
+
+def query_store(query_text: str, k: int = 4, min_score: float = 0.0, export_path: Optional[str] = None):
+    """Performs one-shot semantic search, prints formatted results, and optionally exports."""
     store = LocalVectorStore()
     if not store.chunks:
         print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
@@ -388,6 +422,9 @@ def query_store(query_text: str, k: int = 4, min_score: float = 0.0):
     format_search_results(results)
     elapsed = (time.time() - start_time) * 1000
     print(f"\n[Search completed in {elapsed:.1f} ms]")
+
+    if export_path:
+        export_results(query_text, results, export_path)
 
 
 def chat_session(k: int = 4, min_score: float = 0.0):
@@ -459,6 +496,7 @@ if __name__ == "__main__":
     query_parser.add_argument("query_text", type=str, help="Search query string")
     query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     query_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
+    query_parser.add_argument("--export", type=str, default=None, help="Path to export results (.json or .md)")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
@@ -472,11 +510,10 @@ if __name__ == "__main__":
     if args.command == "ingest":
         ingest(args.path, args.reset)
     elif args.command == "query":
-        query_store(args.query_text, args.top_k, args.min_score)
+        query_store(args.query_text, args.top_k, args.min_score, args.export)
     elif args.command == "chat":
         chat_session(args.top_k, args.min_score)
     elif args.command == "info":
         show_info()
     else:
         parser.print_help()
-
