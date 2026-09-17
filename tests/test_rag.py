@@ -1,6 +1,6 @@
 ﻿"""
 Unit and integration tests for RAG CLI.
-Tests document loaders, chunking mechanics, TF-IDF embedder, and vector retrieval.
+Tests document loaders, chunking mechanics, TF-IDF embedder, BM25 ranking, and vector retrieval.
 """
 
 import os
@@ -13,6 +13,7 @@ from rag import (
     discover_documents,
     load_document,
     export_results,
+    BM25Scorer,
     LocalTFIDFEmbedder,
     LocalVectorStore,
 )
@@ -92,6 +93,20 @@ class TestRagPipeline(unittest.TestCase):
         q_emb = embedder.embed_query("vector search")
         self.assertEqual(len(q_emb), len(embedder.vocabulary))
 
+    def test_bm25_scorer(self):
+        scorer = BM25Scorer(k1=1.5, b=0.75)
+        corpus = [
+            ["chroma", "vector", "database", "retrieval"],
+            ["langchain", "prompt", "engineering", "llm"],
+            ["python", "cli", "terminal", "tool"],
+        ]
+        idf = {"chroma": 1.5, "vector": 1.2, "database": 1.0}
+        scores = scorer.score_corpus(["chroma", "vector"], corpus, idf)
+
+        self.assertEqual(len(scores), 3)
+        self.assertGreater(scores[0], scores[1])
+        self.assertEqual(scores[2], 0.0)
+
     def test_vector_store_end_to_end(self):
         store = LocalVectorStore(db_dir=self.db_dir)
         docs = [
@@ -117,9 +132,39 @@ class TestRagPipeline(unittest.TestCase):
         self.assertEqual(best_match["id"], "chunk_0")
         self.assertGreater(score, 0.0)
 
+        # Test BM25 retrieval
+        bm25_results = store.bm25_search("ChromaDB lookups", k=1)
+        self.assertEqual(len(bm25_results), 1)
+        self.assertEqual(bm25_results[0][0]["id"], "chunk_0")
+
         # Test persistence
         reloaded_store = LocalVectorStore(db_dir=self.db_dir)
         self.assertEqual(len(reloaded_store.chunks), 2)
+
+    def test_metadata_filtering(self):
+        store = LocalVectorStore(db_dir=self.db_dir)
+        docs = [
+            {
+                "id": "c1",
+                "text": "Python code testing chunk.",
+                "metadata": {"filename": "app.py", "chunk_index": 0, "total_chunks": 1},
+            },
+            {
+                "id": "c2",
+                "text": "Documentation testing chunk.",
+                "metadata": {"filename": "manual.md", "chunk_index": 0, "total_chunks": 1},
+            },
+        ]
+        store.add_documents(docs)
+
+        # Filter by filename manual
+        results = store.search("testing", k=2, source_filter="manual")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0]["metadata"]["filename"], "manual.md")
+
+        # Non-matching filter returns empty
+        empty_res = store.search("testing", k=2, source_filter="nonexistent")
+        self.assertEqual(len(empty_res), 0)
 
     def test_export_results_json_and_md(self):
         mock_results = [
