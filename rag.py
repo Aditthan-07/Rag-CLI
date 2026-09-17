@@ -177,7 +177,8 @@ class LocalVectorStore:
     """
     Vector database interface.
     Persists document chunks, metadata, and embeddings locally in the DB directory.
-    Supports both TF-IDF Cosine Similarity and Okapi BM25 retrieval algorithms.
+    Supports both TF-IDF Cosine Similarity and Okapi BM25 retrieval algorithms,
+    along with metadata filtering by source filename.
     """
     def __init__(self, db_dir: str = CHROMA_DIR):
         self.db_dir = db_dir
@@ -230,18 +231,36 @@ class LocalVectorStore:
 
         self.save()
 
-    def similarity_search(self, query: str, k: int = 4, min_score: float = 0.0) -> List[Tuple[Dict[str, Any], float]]:
-        """Computes cosine similarity against all chunks and returns top-k matches filtered by min_score."""
-        if not self.chunks:
+    def _filter_chunks(self, source_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Filters chunks by source document name if filter criteria is specified."""
+        if not source_filter:
+            return self.chunks
+        filter_lower = source_filter.lower()
+        return [
+            c for c in self.chunks
+            if filter_lower in c.get("metadata", {}).get("filename", "").lower()
+            or filter_lower in c.get("metadata", {}).get("source", "").lower()
+        ]
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        min_score: float = 0.0,
+        source_filter: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Computes cosine similarity against eligible chunks and returns top-k matches filtered by min_score."""
+        eligible_chunks = self._filter_chunks(source_filter)
+        if not eligible_chunks:
             return []
 
         q_vec = self.embedder.embed_query(query)
         q_norm = math.sqrt(sum(x * x for x in q_vec))
         if q_norm == 0:
-            return [(self.chunks[i], 0.0) for i in range(min(k, len(self.chunks)))]
+            return [(eligible_chunks[i], 0.0) for i in range(min(k, len(eligible_chunks)))]
 
         scores = []
-        for chunk in self.chunks:
+        for chunk in eligible_chunks:
             c_vec = chunk.get("embedding", [])
             if not c_vec or len(c_vec) != len(q_vec):
                 dot = 0.0
@@ -253,22 +272,28 @@ class LocalVectorStore:
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:k]
 
-    def bm25_search(self, query: str, k: int = 4, min_score: float = 0.0) -> List[Tuple[Dict[str, Any], float]]:
-        """Computes BM25 relevance scores for all chunks and returns top-k matches."""
-        if not self.chunks:
+    def bm25_search(
+        self,
+        query: str,
+        k: int = 4,
+        min_score: float = 0.0,
+        source_filter: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Computes BM25 relevance scores for eligible chunks and returns top-k matches."""
+        eligible_chunks = self._filter_chunks(source_filter)
+        if not eligible_chunks:
             return []
 
         q_tokens = self.embedder._tokenize(query)
         if not q_tokens:
-            return [(self.chunks[i], 0.0) for i in range(min(k, len(self.chunks)))]
+            return [(eligible_chunks[i], 0.0) for i in range(min(k, len(eligible_chunks)))]
 
-        corpus_tokens = [self.embedder._tokenize(c["text"]) for c in self.chunks]
+        corpus_tokens = [self.embedder._tokenize(c["text"]) for c in eligible_chunks]
         raw_scores = self.bm25_scorer.score_corpus(q_tokens, corpus_tokens, self.embedder.idf)
 
-        # Normalize BM25 scores relative to the top hit for intuitive percentage representation
         max_score = max(raw_scores) if raw_scores else 0.0
         normalized_scores = []
-        for chunk, score in zip(self.chunks, raw_scores):
+        for chunk, score in zip(eligible_chunks, raw_scores):
             norm_score = (score / max_score) if max_score > 0 else 0.0
             if norm_score >= min_score:
                 normalized_scores.append((chunk, norm_score))
@@ -276,11 +301,18 @@ class LocalVectorStore:
         normalized_scores.sort(key=lambda item: item[1], reverse=True)
         return normalized_scores[:k]
 
-    def search(self, query: str, k: int = 4, min_score: float = 0.0, algorithm: str = "tfidf") -> List[Tuple[Dict[str, Any], float]]:
-        """Dispatches search based on algorithm choice: 'tfidf' or 'bm25'."""
+    def search(
+        self,
+        query: str,
+        k: int = 4,
+        min_score: float = 0.0,
+        algorithm: str = "tfidf",
+        source_filter: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Dispatches search based on algorithm choice: 'tfidf' or 'bm25' with source filtering."""
         if algorithm.lower() == "bm25":
-            return self.bm25_search(query, k=k, min_score=min_score)
-        return self.similarity_search(query, k=k, min_score=min_score)
+            return self.bm25_search(query, k=k, min_score=min_score, source_filter=source_filter)
+        return self.similarity_search(query, k=k, min_score=min_score, source_filter=source_filter)
 
 
 def load_txt(file_path: str) -> str:
@@ -479,34 +511,52 @@ def export_results(query_text: str, results: List[Tuple[Dict[str, Any], float]],
         print(f"\n[+] Results exported to Markdown: {export_path}")
 
 
-def query_store(query_text: str, k: int = 4, min_score: float = 0.0, export_path: Optional[str] = None, algorithm: str = "tfidf"):
+def query_store(
+    query_text: str,
+    k: int = 4,
+    min_score: float = 0.0,
+    export_path: Optional[str] = None,
+    algorithm: str = "tfidf",
+    source_filter: Optional[str] = None
+):
     """Performs one-shot semantic search, prints formatted results, and optionally exports."""
     store = LocalVectorStore()
     if not store.chunks:
         print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
         return
 
-    print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks via {algorithm.upper()})\n" + "-" * 60)
+    filter_info = f" [filter: '{source_filter}']" if source_filter else ""
+    print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks via {algorithm.upper()}{filter_info})\n" + "-" * 60)
     start_time = time.time()
-    results = store.search(query_text, k=k, min_score=min_score, algorithm=algorithm)
+    results = store.search(query_text, k=k, min_score=min_score, algorithm=algorithm, source_filter=source_filter)
     format_search_results(results, algorithm=algorithm)
     elapsed = (time.time() - start_time) * 1000
-    print(f"\n[Search completed in {elapsed:.1f} ms]")
+
+    # Analytics output
+    q_tokens = set(store.embedder._tokenize(query_text))
+    matched_vocab = [t for t in q_tokens if t in store.embedder.vocabulary]
+    print(f"\n[Analytics: latency={elapsed:.1f}ms | scanned_chunks={len(store._filter_chunks(source_filter))} | matched_terms={len(matched_vocab)}/{len(q_tokens)}]")
 
     if export_path:
         export_results(query_text, results, export_path)
 
 
-def chat_session(k: int = 4, min_score: float = 0.0, algorithm: str = "tfidf"):
+def chat_session(
+    k: int = 4,
+    min_score: float = 0.0,
+    algorithm: str = "tfidf",
+    source_filter: Optional[str] = None
+):
     """Starts an interactive command-line session for continuous retrieval."""
     store = LocalVectorStore()
     if not store.chunks:
         print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
         return
 
+    filter_info = f" | Filter: '{source_filter}'" if source_filter else ""
     print(BANNER)
     print("       Interactive Retrieval Session")
-    print(f"       Algorithm: {algorithm.upper()} | Chunks per query: {k} | Type 'exit' or 'quit' to end")
+    print(f"       Algorithm: {algorithm.upper()}{filter_info} | Chunks per query: {k} | Type 'exit' or 'quit' to end")
     print("=" * 60)
 
     while True:
@@ -518,7 +568,7 @@ def chat_session(k: int = 4, min_score: float = 0.0, algorithm: str = "tfidf"):
                 print("Exiting RAG session. Goodbye!")
                 break
 
-            results = store.search(prompt, k=k, min_score=min_score, algorithm=algorithm)
+            results = store.search(prompt, k=k, min_score=min_score, algorithm=algorithm, source_filter=source_filter)
             format_search_results(results, algorithm=algorithm)
         except (KeyboardInterrupt, EOFError):
             print("\nSession terminated by user. Goodbye!")
@@ -552,7 +602,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="RAG CLI — Command-line Retrieval-Augmented Generation system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py query \"What is RAG?\" --algorithm bm25\n  python rag.py chat -k 3\n  python rag.py info",
+        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py query \"What is RAG?\" --algorithm bm25\n  python rag.py query \"What is RAG?\" --filter intro\n  python rag.py chat -k 3\n  python rag.py info",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -568,12 +618,14 @@ if __name__ == "__main__":
     query_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
     query_parser.add_argument("--export", type=str, default=None, help="Path to export results (.json or .md)")
     query_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
+    query_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     chat_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
     chat_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
+    chat_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
 
     # Info command
     info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
@@ -582,9 +634,9 @@ if __name__ == "__main__":
     if args.command == "ingest":
         ingest(args.path, args.reset)
     elif args.command == "query":
-        query_store(args.query_text, args.top_k, args.min_score, args.export, args.algorithm)
+        query_store(args.query_text, args.top_k, args.min_score, args.export, args.algorithm, args.source_filter)
     elif args.command == "chat":
-        chat_session(args.top_k, args.min_score, args.algorithm)
+        chat_session(args.top_k, args.min_score, args.algorithm, args.source_filter)
     elif args.command == "info":
         show_info()
     else:
