@@ -134,16 +134,57 @@ class LocalTFIDFEmbedder:
                 self.max_features = data.get("max_features", self.max_features)
 
 
+class BM25Scorer:
+    """
+    Implements Okapi BM25 ranking algorithm with term frequency saturation
+    and document length normalization penalty.
+    """
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+
+    def score_corpus(
+        self,
+        query_tokens: List[str],
+        corpus_tokens: List[List[str]],
+        idf: Dict[str, float]
+    ) -> List[float]:
+        """Calculates BM25 relevance scores for all documents in the corpus."""
+        if not corpus_tokens:
+            return []
+
+        avgdl = sum(len(doc) for doc in corpus_tokens) / len(corpus_tokens)
+        if avgdl == 0:
+            avgdl = 1.0
+
+        scores = []
+        for doc in corpus_tokens:
+            doc_len = len(doc)
+            tf = Counter(doc)
+            score = 0.0
+            for term in query_tokens:
+                if term in tf:
+                    term_freq = tf[term]
+                    term_idf = idf.get(term, 0.0)
+                    numerator = term_freq * (self.k1 + 1.0)
+                    denominator = term_freq + self.k1 * (1.0 - self.b + self.b * (doc_len / avgdl))
+                    score += term_idf * (numerator / denominator)
+            scores.append(score)
+        return scores
+
+
 class LocalVectorStore:
     """
     Vector database interface.
     Persists document chunks, metadata, and embeddings locally in the DB directory.
+    Supports both TF-IDF Cosine Similarity and Okapi BM25 retrieval algorithms.
     """
     def __init__(self, db_dir: str = CHROMA_DIR):
         self.db_dir = db_dir
         self.data_file = os.path.join(db_dir, "collection_data.json")
         self.embedder_file = os.path.join(db_dir, "embedder.json")
         self.embedder = LocalTFIDFEmbedder()
+        self.bm25_scorer = BM25Scorer()
         self.chunks: List[Dict[str, Any]] = []
         self._load()
 
@@ -211,6 +252,35 @@ class LocalVectorStore:
 
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores[:k]
+
+    def bm25_search(self, query: str, k: int = 4, min_score: float = 0.0) -> List[Tuple[Dict[str, Any], float]]:
+        """Computes BM25 relevance scores for all chunks and returns top-k matches."""
+        if not self.chunks:
+            return []
+
+        q_tokens = self.embedder._tokenize(query)
+        if not q_tokens:
+            return [(self.chunks[i], 0.0) for i in range(min(k, len(self.chunks)))]
+
+        corpus_tokens = [self.embedder._tokenize(c["text"]) for c in self.chunks]
+        raw_scores = self.bm25_scorer.score_corpus(q_tokens, corpus_tokens, self.embedder.idf)
+
+        # Normalize BM25 scores relative to the top hit for intuitive percentage representation
+        max_score = max(raw_scores) if raw_scores else 0.0
+        normalized_scores = []
+        for chunk, score in zip(self.chunks, raw_scores):
+            norm_score = (score / max_score) if max_score > 0 else 0.0
+            if norm_score >= min_score:
+                normalized_scores.append((chunk, norm_score))
+
+        normalized_scores.sort(key=lambda item: item[1], reverse=True)
+        return normalized_scores[:k]
+
+    def search(self, query: str, k: int = 4, min_score: float = 0.0, algorithm: str = "tfidf") -> List[Tuple[Dict[str, Any], float]]:
+        """Dispatches search based on algorithm choice: 'tfidf' or 'bm25'."""
+        if algorithm.lower() == "bm25":
+            return self.bm25_search(query, k=k, min_score=min_score)
+        return self.similarity_search(query, k=k, min_score=min_score)
 
 
 def load_txt(file_path: str) -> str:
@@ -348,7 +418,7 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
             print(f"  [X] Failed to process '{file_path}': {e}")
 
     if all_chunks:
-        print(f"[*] Generating TF-IDF vector embeddings for {len(all_chunks)} chunks...")
+        print(f"[*] Generating vector embeddings for {len(all_chunks)} chunks...")
         store.add_documents(all_chunks)
         elapsed = time.time() - start_time
         print(f"[SUCCESS] Ingestion completed in {elapsed:.2f}s! Stored {len(store.chunks)} total chunks in '{CHROMA_DIR}'.")
@@ -356,7 +426,7 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
         print("[!] No chunks were produced.")
 
 
-def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
+def format_search_results(results: List[Tuple[Dict[str, Any], float]], algorithm: str = "tfidf"):
     """Utility to print search results in a clean, readable format."""
     if not results:
         print("\n[!] No matching document chunks exceeded the relevance threshold.")
@@ -369,7 +439,7 @@ def format_search_results(results: List[Tuple[Dict[str, Any], float]]):
         tot = meta.get("total_chunks", 1)
         sim_pct = max(0.0, score * 100)
 
-        print(f"\n[Result #{rank}] Relevance: {sim_pct:.1f}% | Source: {fname} (chunk {idx + 1}/{tot})")
+        print(f"\n[Result #{rank}] Relevance: {sim_pct:.1f}% ({algorithm.upper()}) | Source: {fname} (chunk {idx + 1}/{tot})")
         print("~" * 60)
         lines = chunk["text"].splitlines()
         for line in lines:
@@ -409,17 +479,17 @@ def export_results(query_text: str, results: List[Tuple[Dict[str, Any], float]],
         print(f"\n[+] Results exported to Markdown: {export_path}")
 
 
-def query_store(query_text: str, k: int = 4, min_score: float = 0.0, export_path: Optional[str] = None):
+def query_store(query_text: str, k: int = 4, min_score: float = 0.0, export_path: Optional[str] = None, algorithm: str = "tfidf"):
     """Performs one-shot semantic search, prints formatted results, and optionally exports."""
     store = LocalVectorStore()
     if not store.chunks:
         print("[!] Vector database is empty. Please run 'python rag.py ingest' first.")
         return
 
-    print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks)\n" + "-" * 60)
+    print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks via {algorithm.upper()})\n" + "-" * 60)
     start_time = time.time()
-    results = store.similarity_search(query_text, k=k, min_score=min_score)
-    format_search_results(results)
+    results = store.search(query_text, k=k, min_score=min_score, algorithm=algorithm)
+    format_search_results(results, algorithm=algorithm)
     elapsed = (time.time() - start_time) * 1000
     print(f"\n[Search completed in {elapsed:.1f} ms]")
 
@@ -427,7 +497,7 @@ def query_store(query_text: str, k: int = 4, min_score: float = 0.0, export_path
         export_results(query_text, results, export_path)
 
 
-def chat_session(k: int = 4, min_score: float = 0.0):
+def chat_session(k: int = 4, min_score: float = 0.0, algorithm: str = "tfidf"):
     """Starts an interactive command-line session for continuous retrieval."""
     store = LocalVectorStore()
     if not store.chunks:
@@ -436,7 +506,7 @@ def chat_session(k: int = 4, min_score: float = 0.0):
 
     print(BANNER)
     print("       Interactive Retrieval Session")
-    print(f"       Chunks per query: {k} | Type 'exit' or 'quit' to end")
+    print(f"       Algorithm: {algorithm.upper()} | Chunks per query: {k} | Type 'exit' or 'quit' to end")
     print("=" * 60)
 
     while True:
@@ -448,8 +518,8 @@ def chat_session(k: int = 4, min_score: float = 0.0):
                 print("Exiting RAG session. Goodbye!")
                 break
 
-            results = store.similarity_search(prompt, k=k, min_score=min_score)
-            format_search_results(results)
+            results = store.search(prompt, k=k, min_score=min_score, algorithm=algorithm)
+            format_search_results(results, algorithm=algorithm)
         except (KeyboardInterrupt, EOFError):
             print("\nSession terminated by user. Goodbye!")
             break
@@ -482,7 +552,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="RAG CLI — Command-line Retrieval-Augmented Generation system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py chat -k 3\n  python rag.py info",
+        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py query \"What is RAG?\" --algorithm bm25\n  python rag.py chat -k 3\n  python rag.py info",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -497,11 +567,13 @@ if __name__ == "__main__":
     query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     query_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
     query_parser.add_argument("--export", type=str, default=None, help="Path to export results (.json or .md)")
+    query_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     chat_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
+    chat_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
 
     # Info command
     info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
@@ -510,9 +582,9 @@ if __name__ == "__main__":
     if args.command == "ingest":
         ingest(args.path, args.reset)
     elif args.command == "query":
-        query_store(args.query_text, args.top_k, args.min_score, args.export)
+        query_store(args.query_text, args.top_k, args.min_score, args.export, args.algorithm)
     elif args.command == "chat":
-        chat_session(args.top_k, args.min_score)
+        chat_session(args.top_k, args.min_score, args.algorithm)
     elif args.command == "info":
         show_info()
     else:
