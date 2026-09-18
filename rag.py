@@ -9,6 +9,7 @@ import time
 import json
 import math
 import shutil
+import hashlib
 import argparse
 from collections import Counter
 from typing import List, Dict, Any, Tuple, Optional, Set
@@ -196,16 +197,18 @@ class BM25Scorer:
 class LocalVectorStore:
     """
     Vector database interface.
-    Persists document chunks, metadata, and embeddings locally in the DB directory.
-    Supports TF-IDF Cosine Similarity, Okapi BM25, and Hybrid Reciprocal Rank Fusion (RRF).
+    Persists document chunks, metadata, content hashes, and embeddings locally in the DB directory.
+    Supports incremental indexing, TF-IDF Cosine Similarity, Okapi BM25, and Hybrid RRF.
     """
     def __init__(self, db_dir: str = CHROMA_DIR):
         self.db_dir = db_dir
         self.data_file = os.path.join(db_dir, "collection_data.json")
         self.embedder_file = os.path.join(db_dir, "embedder.json")
+        self.hashes_file = os.path.join(db_dir, "doc_hashes.json")
         self.embedder = LocalTFIDFEmbedder()
         self.bm25_scorer = BM25Scorer()
         self.chunks: List[Dict[str, Any]] = []
+        self.doc_hashes: Dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -216,21 +219,34 @@ class LocalVectorStore:
                 self.embedder.load(self.embedder_file)
             except Exception:
                 self.chunks = []
+        if os.path.exists(self.hashes_file):
+            try:
+                with open(self.hashes_file, "r", encoding="utf-8") as f:
+                    self.doc_hashes = json.load(f)
+            except Exception:
+                self.doc_hashes = {}
 
     def save(self):
         os.makedirs(self.db_dir, exist_ok=True)
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump(self.chunks, f, indent=2)
+        with open(self.hashes_file, "w", encoding="utf-8") as f:
+            json.dump(self.doc_hashes, f, indent=2)
         self.embedder.save(self.embedder_file)
 
     def reset(self):
         self.chunks = []
+        self.doc_hashes = {}
         if os.path.exists(self.db_dir):
             shutil.rmtree(self.db_dir)
         os.makedirs(self.db_dir, exist_ok=True)
 
+    def remove_document_chunks(self, file_path: str):
+        """Removes existing chunks associated with a specific document prior to re-indexing."""
+        self.chunks = [c for c in self.chunks if c.get("metadata", {}).get("source") != file_path]
+
     def add_documents(self, documents: List[Dict[str, Any]], remove_stopwords: bool = True):
-        """Indexes new document chunks and fits embeddings."""
+        """Indexes new document chunks and re-fits embeddings across the full corpus."""
         existing_docs = [c["text"] for c in self.chunks]
         all_docs = existing_docs + [d["text"] for d in documents]
 
@@ -475,7 +491,7 @@ def discover_documents(target_path: str) -> List[str]:
 
 
 def ingest(target_path: str = DOCS_DIR, reset: bool = False, remove_stopwords: bool = True):
-    """Loads documents, splits into chunks, and stores into the vector database."""
+    """Loads documents incrementally, splits into chunks, and stores into the vector database."""
     start_time = time.time()
     print(BANNER)
     print(f"[*] Initializing ingestion pipeline (Target: {target_path})")
@@ -490,17 +506,28 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False, remove_stopwords: b
         print(f"[!] No valid .pdf, .txt, or .md documents discovered in '{target_path}'.")
         return
 
-    print(f"[+] Found {len(doc_files)} document(s) to process.")
-    all_chunks = []
+    print(f"[+] Discovered {len(doc_files)} candidate document(s).")
+    all_new_chunks = []
+    skipped_count = 0
 
     for file_path in doc_files:
         try:
             content = load_document(file_path)
-            chunks = split_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
+            content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
             base_name = os.path.basename(file_path)
 
+            if not reset and store.doc_hashes.get(file_path) == content_hash:
+                print(f"  -> Unchanged: '{base_name}' (cached, skipped)")
+                skipped_count += 1
+                continue
+
+            # If modified or new, clear old chunks for this document
+            store.remove_document_chunks(file_path)
+            store.doc_hashes[file_path] = content_hash
+
+            chunks = split_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
             for i, chunk_text in enumerate(chunks):
-                all_chunks.append({
+                all_new_chunks.append({
                     "id": f"{base_name}_chunk_{i}",
                     "text": chunk_text,
                     "metadata": {
@@ -515,11 +542,14 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False, remove_stopwords: b
         except Exception as e:
             print(f"  [X] Failed to process '{file_path}': {e}")
 
-    if all_chunks:
-        print(f"[*] Generating vector embeddings for {len(all_chunks)} chunks...")
-        store.add_documents(all_chunks, remove_stopwords=remove_stopwords)
+    if all_new_chunks:
+        print(f"[*] Updating vector index for {len(all_new_chunks)} new/modified chunks...")
+        store.add_documents(all_new_chunks, remove_stopwords=remove_stopwords)
         elapsed = time.time() - start_time
-        print(f"[SUCCESS] Ingestion completed in {elapsed:.2f}s! Stored {len(store.chunks)} total chunks in '{CHROMA_DIR}'.")
+        print(f"[SUCCESS] Ingestion finished in {elapsed:.2f}s! Total chunks in DB: {len(store.chunks)} (Skipped unchanged: {skipped_count}).")
+    elif skipped_count > 0:
+        elapsed = time.time() - start_time
+        print(f"[SUCCESS] Ingestion finished in {elapsed:.2f}s! All {skipped_count} document(s) are already up to date.")
     else:
         print("[!] No chunks were produced.")
 
