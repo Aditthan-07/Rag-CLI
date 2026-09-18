@@ -11,7 +11,7 @@ import math
 import shutil
 import argparse
 from collections import Counter
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 # Ensure standard streams handle UTF-8 properly on Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -25,6 +25,22 @@ DOCS_DIR = os.environ.get("DOCS_DIR", "./docs")
 EMBED_DIM = 1024
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
+
+DEFAULT_STOPWORDS: Set[str] = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+    "any", "are", "as", "at", "be", "because", "been", "before", "being", "below",
+    "between", "both", "but", "by", "could", "did", "do", "does", "doing", "down",
+    "during", "each", "few", "for", "from", "further", "had", "has", "have", "having",
+    "he", "her", "here", "hers", "herself", "him", "himself", "his", "how", "i",
+    "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more", "most",
+    "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only",
+    "or", "other", "our", "ours", "ourselves", "out", "over", "own", "s", "same",
+    "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs",
+    "them", "themselves", "then", "there", "these", "they", "this", "those", "through",
+    "to", "too", "under", "until", "up", "very", "was", "we", "were", "what", "when",
+    "where", "which", "while", "who", "whom", "why", "with", "would", "you", "your",
+    "yours", "yourself", "yourselves"
+}
 
 BANNER = r"""
 =============================================================
@@ -48,7 +64,7 @@ class LocalTFIDFEmbedder:
         self.idf: Dict[str, float] = {}
         self.num_docs = 0
 
-    def _tokenize(self, text: str) -> List[str]:
+    def _tokenize(self, text: str, remove_stopwords: bool = True) -> List[str]:
         words = []
         token = []
         for char in text.lower():
@@ -56,19 +72,23 @@ class LocalTFIDFEmbedder:
                 token.append(char)
             else:
                 if token:
-                    words.append("".join(token))
+                    w = "".join(token)
+                    if not remove_stopwords or (w not in DEFAULT_STOPWORDS and len(w) > 1):
+                        words.append(w)
                     token = []
         if token:
-            words.append("".join(token))
+            w = "".join(token)
+            if not remove_stopwords or (w not in DEFAULT_STOPWORDS and len(w) > 1):
+                words.append(w)
         return words
 
-    def fit(self, documents: List[str]):
+    def fit(self, documents: List[str], remove_stopwords: bool = True):
         """Fits vocabulary and computes inverse document frequencies (IDF)."""
         self.num_docs = len(documents)
         doc_freq = Counter()
 
         for doc in documents:
-            tokens = set(self._tokenize(doc))
+            tokens = set(self._tokenize(doc, remove_stopwords=remove_stopwords))
             for t in tokens:
                 doc_freq[t] += 1
 
@@ -79,18 +99,18 @@ class LocalTFIDFEmbedder:
         for word, count in most_common:
             self.idf[word] = math.log((1 + self.num_docs) / (1 + count)) + 1.0
 
-    def embed_query(self, text: str) -> List[float]:
+    def embed_query(self, text: str, remove_stopwords: bool = True) -> List[float]:
         """Generates embedding vector for a single query."""
-        return self.embed_documents([text])[0]
+        return self.embed_documents([text], remove_stopwords=remove_stopwords)[0]
 
-    def embed_documents(self, documents: List[str]) -> List[List[float]]:
+    def embed_documents(self, documents: List[str], remove_stopwords: bool = True) -> List[List[float]]:
         """Transforms documents into L2-normalized TF-IDF vector embeddings."""
         embeddings = []
         dim = len(self.vocabulary) or self.max_features
 
         for doc in documents:
             vec = [0.0] * dim
-            tokens = self._tokenize(doc)
+            tokens = self._tokenize(doc, remove_stopwords=remove_stopwords)
             if not tokens or not self.vocabulary:
                 embeddings.append(vec)
                 continue
@@ -209,22 +229,22 @@ class LocalVectorStore:
             shutil.rmtree(self.db_dir)
         os.makedirs(self.db_dir, exist_ok=True)
 
-    def add_documents(self, documents: List[Dict[str, Any]]):
+    def add_documents(self, documents: List[Dict[str, Any]], remove_stopwords: bool = True):
         """Indexes new document chunks and fits embeddings."""
         existing_docs = [c["text"] for c in self.chunks]
         all_docs = existing_docs + [d["text"] for d in documents]
 
-        self.embedder.fit(all_docs)
+        self.embedder.fit(all_docs, remove_stopwords=remove_stopwords)
 
         new_texts = [d["text"] for d in documents]
-        new_embeddings = self.embedder.embed_documents(new_texts)
+        new_embeddings = self.embedder.embed_documents(new_texts, remove_stopwords=remove_stopwords)
 
         for d, emb in zip(documents, new_embeddings):
             d["embedding"] = emb
             self.chunks.append(d)
 
         if existing_docs:
-            updated_existing = self.embedder.embed_documents(existing_docs)
+            updated_existing = self.embedder.embed_documents(existing_docs, remove_stopwords=remove_stopwords)
             for chunk, emb in zip(self.chunks[:len(existing_docs)], updated_existing):
                 chunk["embedding"] = emb
 
@@ -246,14 +266,15 @@ class LocalVectorStore:
         query: str,
         k: int = 4,
         min_score: float = 0.0,
-        source_filter: Optional[str] = None
+        source_filter: Optional[str] = None,
+        remove_stopwords: bool = True
     ) -> List[Tuple[Dict[str, Any], float]]:
         """Computes cosine similarity against eligible chunks and returns top-k matches filtered by min_score."""
         eligible_chunks = self._filter_chunks(source_filter)
         if not eligible_chunks:
             return []
 
-        q_vec = self.embedder.embed_query(query)
+        q_vec = self.embedder.embed_query(query, remove_stopwords=remove_stopwords)
         q_norm = math.sqrt(sum(x * x for x in q_vec))
         if q_norm == 0:
             return [(eligible_chunks[i], 0.0) for i in range(min(k, len(eligible_chunks)))]
@@ -276,18 +297,19 @@ class LocalVectorStore:
         query: str,
         k: int = 4,
         min_score: float = 0.0,
-        source_filter: Optional[str] = None
+        source_filter: Optional[str] = None,
+        remove_stopwords: bool = True
     ) -> List[Tuple[Dict[str, Any], float]]:
         """Computes BM25 relevance scores for eligible chunks and returns top-k matches."""
         eligible_chunks = self._filter_chunks(source_filter)
         if not eligible_chunks:
             return []
 
-        q_tokens = self.embedder._tokenize(query)
+        q_tokens = self.embedder._tokenize(query, remove_stopwords=remove_stopwords)
         if not q_tokens:
             return [(eligible_chunks[i], 0.0) for i in range(min(k, len(eligible_chunks)))]
 
-        corpus_tokens = [self.embedder._tokenize(c["text"]) for c in eligible_chunks]
+        corpus_tokens = [self.embedder._tokenize(c["text"], remove_stopwords=remove_stopwords) for c in eligible_chunks]
         raw_scores = self.bm25_scorer.score_corpus(q_tokens, corpus_tokens, self.embedder.idf)
 
         max_score = max(raw_scores) if raw_scores else 0.0
@@ -306,36 +328,31 @@ class LocalVectorStore:
         k: int = 4,
         min_score: float = 0.0,
         source_filter: Optional[str] = None,
+        remove_stopwords: bool = True,
         rrf_k: int = 60
     ) -> List[Tuple[Dict[str, Any], float]]:
-        """
-        Combines TF-IDF and BM25 search results using Reciprocal Rank Fusion (RRF).
-        RRF Score = 1 / (rrf_k + rank_tfidf) + 1 / (rrf_k + rank_bm25).
-        """
+        """Combines TF-IDF and BM25 search results using Reciprocal Rank Fusion (RRF)."""
         eligible_chunks = self._filter_chunks(source_filter)
         if not eligible_chunks:
             return []
 
         total_eligible = len(eligible_chunks)
-        tfidf_res = self.similarity_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter)
-        bm25_res = self.bm25_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter)
+        tfidf_res = self.similarity_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter, remove_stopwords=remove_stopwords)
+        bm25_res = self.bm25_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter, remove_stopwords=remove_stopwords)
 
         rrf_scores: Dict[str, float] = {}
         chunk_map: Dict[str, Dict[str, Any]] = {}
 
-        # Accumulate TF-IDF ranks
         for rank, (chunk, _) in enumerate(tfidf_res, start=1):
             cid = chunk["id"]
             chunk_map[cid] = chunk
             rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
 
-        # Accumulate BM25 ranks
         for rank, (chunk, _) in enumerate(bm25_res, start=1):
             cid = chunk["id"]
             chunk_map[cid] = chunk
             rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
 
-        # Normalize relative to max possible score: 2 / (rrf_k + 1)
         max_possible = 2.0 / (rrf_k + 1.0)
         final_results = []
         for cid, rrf_val in rrf_scores.items():
@@ -352,15 +369,16 @@ class LocalVectorStore:
         k: int = 4,
         min_score: float = 0.0,
         algorithm: str = "hybrid",
-        source_filter: Optional[str] = None
+        source_filter: Optional[str] = None,
+        remove_stopwords: bool = True
     ) -> List[Tuple[Dict[str, Any], float]]:
-        """Dispatches search based on algorithm choice: 'tfidf', 'bm25', or 'hybrid' (RRF)."""
+        """Dispatches search based on algorithm choice: 'tfidf', 'bm25', or 'hybrid'."""
         algo = algorithm.lower()
         if algo == "bm25":
-            return self.bm25_search(query, k=k, min_score=min_score, source_filter=source_filter)
+            return self.bm25_search(query, k=k, min_score=min_score, source_filter=source_filter, remove_stopwords=remove_stopwords)
         elif algo == "hybrid":
-            return self.hybrid_search(query, k=k, min_score=min_score, source_filter=source_filter)
-        return self.similarity_search(query, k=k, min_score=min_score, source_filter=source_filter)
+            return self.hybrid_search(query, k=k, min_score=min_score, source_filter=source_filter, remove_stopwords=remove_stopwords)
+        return self.similarity_search(query, k=k, min_score=min_score, source_filter=source_filter, remove_stopwords=remove_stopwords)
 
 
 def load_txt(file_path: str) -> str:
@@ -456,7 +474,7 @@ def discover_documents(target_path: str) -> List[str]:
     return sorted(found)
 
 
-def ingest(target_path: str = DOCS_DIR, reset: bool = False):
+def ingest(target_path: str = DOCS_DIR, reset: bool = False, remove_stopwords: bool = True):
     """Loads documents, splits into chunks, and stores into the vector database."""
     start_time = time.time()
     print(BANNER)
@@ -499,7 +517,7 @@ def ingest(target_path: str = DOCS_DIR, reset: bool = False):
 
     if all_chunks:
         print(f"[*] Generating vector embeddings for {len(all_chunks)} chunks...")
-        store.add_documents(all_chunks)
+        store.add_documents(all_chunks, remove_stopwords=remove_stopwords)
         elapsed = time.time() - start_time
         print(f"[SUCCESS] Ingestion completed in {elapsed:.2f}s! Stored {len(store.chunks)} total chunks in '{CHROMA_DIR}'.")
     else:
@@ -565,7 +583,8 @@ def query_store(
     min_score: float = 0.0,
     export_path: Optional[str] = None,
     algorithm: str = "hybrid",
-    source_filter: Optional[str] = None
+    source_filter: Optional[str] = None,
+    remove_stopwords: bool = True
 ):
     """Performs one-shot semantic search, prints formatted results, and optionally exports."""
     store = LocalVectorStore()
@@ -576,11 +595,18 @@ def query_store(
     filter_info = f" [filter: '{source_filter}']" if source_filter else ""
     print(f"\n[QUERY] \"{query_text}\" (retrieving top-{k} chunks via {algorithm.upper()}{filter_info})\n" + "-" * 60)
     start_time = time.time()
-    results = store.search(query_text, k=k, min_score=min_score, algorithm=algorithm, source_filter=source_filter)
+    results = store.search(
+        query_text,
+        k=k,
+        min_score=min_score,
+        algorithm=algorithm,
+        source_filter=source_filter,
+        remove_stopwords=remove_stopwords
+    )
     format_search_results(results, algorithm=algorithm)
     elapsed = (time.time() - start_time) * 1000
 
-    q_tokens = set(store.embedder._tokenize(query_text))
+    q_tokens = set(store.embedder._tokenize(query_text, remove_stopwords=remove_stopwords))
     matched_vocab = [t for t in q_tokens if t in store.embedder.vocabulary]
     print(f"\n[Analytics: latency={elapsed:.1f}ms | scanned_chunks={len(store._filter_chunks(source_filter))} | matched_terms={len(matched_vocab)}/{len(q_tokens)}]")
 
@@ -592,7 +618,8 @@ def chat_session(
     k: int = 4,
     min_score: float = 0.0,
     algorithm: str = "hybrid",
-    source_filter: Optional[str] = None
+    source_filter: Optional[str] = None,
+    remove_stopwords: bool = True
 ):
     """Starts an interactive command-line session for continuous retrieval."""
     store = LocalVectorStore()
@@ -615,7 +642,14 @@ def chat_session(
                 print("Exiting RAG session. Goodbye!")
                 break
 
-            results = store.search(prompt, k=k, min_score=min_score, algorithm=algorithm, source_filter=source_filter)
+            results = store.search(
+                prompt,
+                k=k,
+                min_score=min_score,
+                algorithm=algorithm,
+                source_filter=source_filter,
+                remove_stopwords=remove_stopwords
+            )
             format_search_results(results, algorithm=algorithm)
         except (KeyboardInterrupt, EOFError):
             print("\nSession terminated by user. Goodbye!")
@@ -657,6 +691,7 @@ if __name__ == "__main__":
     ingest_parser = subparsers.add_parser("ingest", help="Ingest documents into vector store")
     ingest_parser.add_argument("path", nargs="?", default=DOCS_DIR, help="Path to file or folder")
     ingest_parser.add_argument("--reset", action="store_true", help="Clear existing database before ingest")
+    ingest_parser.add_argument("--keep-stopwords", action="store_true", help="Keep common English stopwords in embeddings")
 
     # Query command
     query_parser = subparsers.add_parser("query", help="One-shot semantic query")
@@ -666,6 +701,7 @@ if __name__ == "__main__":
     query_parser.add_argument("--export", type=str, default=None, help="Path to export results (.json or .md)")
     query_parser.add_argument("--algorithm", choices=["tfidf", "bm25", "hybrid"], default="hybrid", help="Ranking algorithm (tfidf, bm25, or hybrid RRF)")
     query_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
+    query_parser.add_argument("--keep-stopwords", action="store_true", help="Do not filter stopwords during query parsing")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
@@ -673,17 +709,18 @@ if __name__ == "__main__":
     chat_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
     chat_parser.add_argument("--algorithm", choices=["tfidf", "bm25", "hybrid"], default="hybrid", help="Ranking algorithm (tfidf, bm25, or hybrid RRF)")
     chat_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
+    chat_parser.add_argument("--keep-stopwords", action="store_true", help="Do not filter stopwords during chat queries")
 
     # Info command
     info_parser = subparsers.add_parser("info", help="Display vector store info and statistics")
 
     args = parser.parse_args()
     if args.command == "ingest":
-        ingest(args.path, args.reset)
+        ingest(args.path, args.reset, remove_stopwords=not args.keep_stopwords)
     elif args.command == "query":
-        query_store(args.query_text, args.top_k, args.min_score, args.export, args.algorithm, args.source_filter)
+        query_store(args.query_text, args.top_k, args.min_score, args.export, args.algorithm, args.source_filter, remove_stopwords=not args.keep_stopwords)
     elif args.command == "chat":
-        chat_session(args.top_k, args.min_score, args.algorithm, args.source_filter)
+        chat_session(args.top_k, args.min_score, args.algorithm, args.source_filter, remove_stopwords=not args.keep_stopwords)
     elif args.command == "info":
         show_info()
     else:
