@@ -1,11 +1,13 @@
 ﻿"""
 Unit and integration tests for RAG CLI.
-Tests document loaders, chunking mechanics, TF-IDF embedder, BM25 ranking, and vector retrieval.
+Tests document loaders, chunking mechanics, TF-IDF embedder, BM25 ranking,
+Hybrid RRF search, stopwords filtering, and incremental ingestion.
 """
 
 import os
 import json
 import shutil
+import hashlib
 import tempfile
 import unittest
 from rag import (
@@ -71,6 +73,25 @@ class TestRagPipeline(unittest.TestCase):
         content = load_document(md_file)
         self.assertEqual(content, sample_md)
 
+    def test_stopwords_tokenization(self):
+        embedder = LocalTFIDFEmbedder()
+        raw_text = "This is an informative test about the retrieval algorithm."
+
+        # Filtered stopwords
+        filtered_tokens = embedder._tokenize(raw_text, remove_stopwords=True)
+        self.assertNotIn("this", filtered_tokens)
+        self.assertNotIn("is", filtered_tokens)
+        self.assertNotIn("an", filtered_tokens)
+        self.assertNotIn("about", filtered_tokens)
+        self.assertNotIn("the", filtered_tokens)
+        self.assertIn("informative", filtered_tokens)
+        self.assertIn("retrieval", filtered_tokens)
+
+        # Retained stopwords
+        raw_tokens = embedder._tokenize(raw_text, remove_stopwords=False)
+        self.assertIn("this", raw_tokens)
+        self.assertIn("the", raw_tokens)
+
     def test_tfidf_embedder(self):
         docs = [
             "Vector databases are optimized for similarity search.",
@@ -84,12 +105,10 @@ class TestRagPipeline(unittest.TestCase):
         embeddings = embedder.embed_documents(docs)
         self.assertEqual(len(embeddings), 3)
 
-        # Check vector normalization (length close to 1.0)
         for emb in embeddings:
             norm = sum(x * x for x in emb) ** 0.5
             self.assertAlmostEqual(norm, 1.0, places=4)
 
-        # Query embedding
         q_emb = embedder.embed_query("vector search")
         self.assertEqual(len(q_emb), len(embedder.vocabulary))
 
@@ -141,6 +160,48 @@ class TestRagPipeline(unittest.TestCase):
         reloaded_store = LocalVectorStore(db_dir=self.db_dir)
         self.assertEqual(len(reloaded_store.chunks), 2)
 
+    def test_hybrid_rrf_search(self):
+        store = LocalVectorStore(db_dir=self.db_dir)
+        docs = [
+            {
+                "id": "c_hybrid_1",
+                "text": "Reciprocal Rank Fusion merges multiple ranked search lists.",
+                "metadata": {"filename": "rrf.md", "chunk_index": 0, "total_chunks": 1},
+            },
+            {
+                "id": "c_hybrid_2",
+                "text": "Unrelated documentation regarding compilers and AST parsing.",
+                "metadata": {"filename": "ast.md", "chunk_index": 0, "total_chunks": 1},
+            },
+        ]
+        store.add_documents(docs)
+
+        # Hybrid search query
+        results = store.search("Reciprocal Rank Fusion ranked search", k=1, algorithm="hybrid")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0]["id"], "c_hybrid_1")
+        self.assertGreater(results[0][1], 0.5)
+
+    def test_incremental_hashing_and_removal(self):
+        store = LocalVectorStore(db_dir=self.db_dir)
+        sample_path = "C:/docs/file1.txt"
+        file_hash = hashlib.md5(b"Version 1 content").hexdigest()
+        store.doc_hashes[sample_path] = file_hash
+
+        docs = [
+            {
+                "id": "c1",
+                "text": "Version 1 chunk text.",
+                "metadata": {"source": sample_path, "filename": "file1.txt"},
+            }
+        ]
+        store.add_documents(docs)
+        self.assertEqual(len(store.chunks), 1)
+
+        # Re-index with updated content: removal works cleanly
+        store.remove_document_chunks(sample_path)
+        self.assertEqual(len(store.chunks), 0)
+
     def test_metadata_filtering(self):
         store = LocalVectorStore(db_dir=self.db_dir)
         docs = [
@@ -157,12 +218,10 @@ class TestRagPipeline(unittest.TestCase):
         ]
         store.add_documents(docs)
 
-        # Filter by filename manual
         results = store.search("testing", k=2, source_filter="manual")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0][0]["metadata"]["filename"], "manual.md")
 
-        # Non-matching filter returns empty
         empty_res = store.search("testing", k=2, source_filter="nonexistent")
         self.assertEqual(len(empty_res), 0)
 
