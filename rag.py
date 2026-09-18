@@ -177,8 +177,7 @@ class LocalVectorStore:
     """
     Vector database interface.
     Persists document chunks, metadata, and embeddings locally in the DB directory.
-    Supports both TF-IDF Cosine Similarity and Okapi BM25 retrieval algorithms,
-    along with metadata filtering by source filename.
+    Supports TF-IDF Cosine Similarity, Okapi BM25, and Hybrid Reciprocal Rank Fusion (RRF).
     """
     def __init__(self, db_dir: str = CHROMA_DIR):
         self.db_dir = db_dir
@@ -301,17 +300,66 @@ class LocalVectorStore:
         normalized_scores.sort(key=lambda item: item[1], reverse=True)
         return normalized_scores[:k]
 
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 4,
+        min_score: float = 0.0,
+        source_filter: Optional[str] = None,
+        rrf_k: int = 60
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """
+        Combines TF-IDF and BM25 search results using Reciprocal Rank Fusion (RRF).
+        RRF Score = 1 / (rrf_k + rank_tfidf) + 1 / (rrf_k + rank_bm25).
+        """
+        eligible_chunks = self._filter_chunks(source_filter)
+        if not eligible_chunks:
+            return []
+
+        total_eligible = len(eligible_chunks)
+        tfidf_res = self.similarity_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter)
+        bm25_res = self.bm25_search(query, k=total_eligible, min_score=0.0, source_filter=source_filter)
+
+        rrf_scores: Dict[str, float] = {}
+        chunk_map: Dict[str, Dict[str, Any]] = {}
+
+        # Accumulate TF-IDF ranks
+        for rank, (chunk, _) in enumerate(tfidf_res, start=1):
+            cid = chunk["id"]
+            chunk_map[cid] = chunk
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+
+        # Accumulate BM25 ranks
+        for rank, (chunk, _) in enumerate(bm25_res, start=1):
+            cid = chunk["id"]
+            chunk_map[cid] = chunk
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+
+        # Normalize relative to max possible score: 2 / (rrf_k + 1)
+        max_possible = 2.0 / (rrf_k + 1.0)
+        final_results = []
+        for cid, rrf_val in rrf_scores.items():
+            normalized = min(1.0, rrf_val / max_possible)
+            if normalized >= min_score:
+                final_results.append((chunk_map[cid], normalized))
+
+        final_results.sort(key=lambda item: item[1], reverse=True)
+        return final_results[:k]
+
     def search(
         self,
         query: str,
         k: int = 4,
         min_score: float = 0.0,
-        algorithm: str = "tfidf",
+        algorithm: str = "hybrid",
         source_filter: Optional[str] = None
     ) -> List[Tuple[Dict[str, Any], float]]:
-        """Dispatches search based on algorithm choice: 'tfidf' or 'bm25' with source filtering."""
-        if algorithm.lower() == "bm25":
+        """Dispatches search based on algorithm choice: 'tfidf', 'bm25', or 'hybrid' (RRF)."""
+        algo = algorithm.lower()
+        if algo == "bm25":
             return self.bm25_search(query, k=k, min_score=min_score, source_filter=source_filter)
+        elif algo == "hybrid":
+            return self.hybrid_search(query, k=k, min_score=min_score, source_filter=source_filter)
         return self.similarity_search(query, k=k, min_score=min_score, source_filter=source_filter)
 
 
@@ -516,7 +564,7 @@ def query_store(
     k: int = 4,
     min_score: float = 0.0,
     export_path: Optional[str] = None,
-    algorithm: str = "tfidf",
+    algorithm: str = "hybrid",
     source_filter: Optional[str] = None
 ):
     """Performs one-shot semantic search, prints formatted results, and optionally exports."""
@@ -532,7 +580,6 @@ def query_store(
     format_search_results(results, algorithm=algorithm)
     elapsed = (time.time() - start_time) * 1000
 
-    # Analytics output
     q_tokens = set(store.embedder._tokenize(query_text))
     matched_vocab = [t for t in q_tokens if t in store.embedder.vocabulary]
     print(f"\n[Analytics: latency={elapsed:.1f}ms | scanned_chunks={len(store._filter_chunks(source_filter))} | matched_terms={len(matched_vocab)}/{len(q_tokens)}]")
@@ -544,7 +591,7 @@ def query_store(
 def chat_session(
     k: int = 4,
     min_score: float = 0.0,
-    algorithm: str = "tfidf",
+    algorithm: str = "hybrid",
     source_filter: Optional[str] = None
 ):
     """Starts an interactive command-line session for continuous retrieval."""
@@ -602,7 +649,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="RAG CLI — Command-line Retrieval-Augmented Generation system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py query \"What is RAG?\" --algorithm bm25\n  python rag.py query \"What is RAG?\" --filter intro\n  python rag.py chat -k 3\n  python rag.py info",
+        epilog="Examples:\n  python rag.py ingest\n  python rag.py query \"What is RAG?\"\n  python rag.py query \"What is RAG?\" --algorithm hybrid\n  python rag.py query \"What is RAG?\" --filter intro\n  python rag.py chat -k 3\n  python rag.py info",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -617,14 +664,14 @@ if __name__ == "__main__":
     query_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     query_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
     query_parser.add_argument("--export", type=str, default=None, help="Path to export results (.json or .md)")
-    query_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
+    query_parser.add_argument("--algorithm", choices=["tfidf", "bm25", "hybrid"], default="hybrid", help="Ranking algorithm (tfidf, bm25, or hybrid RRF)")
     query_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
 
     # Chat command
     chat_parser = subparsers.add_parser("chat", help="Start interactive terminal chat session")
     chat_parser.add_argument("-k", "--top-k", type=int, default=4, help="Number of chunks to return")
     chat_parser.add_argument("--min-score", type=float, default=0.0, help="Minimum similarity score threshold (0.0 to 1.0)")
-    chat_parser.add_argument("--algorithm", choices=["tfidf", "bm25"], default="tfidf", help="Ranking algorithm (tfidf or bm25)")
+    chat_parser.add_argument("--algorithm", choices=["tfidf", "bm25", "hybrid"], default="hybrid", help="Ranking algorithm (tfidf, bm25, or hybrid RRF)")
     chat_parser.add_argument("--filter", type=str, default=None, dest="source_filter", help="Filter chunks by source filename substring")
 
     # Info command
